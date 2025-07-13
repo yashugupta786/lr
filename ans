@@ -1,0 +1,157 @@
+from fastapi import APIRouter, Request, Depends
+from datetime import datetime
+from app.models.schemas import AnswerObj
+from app.logger import logger, log_and_raise
+from app.dependencies import get_cursor
+import traceback
+
+router = APIRouter()
+
+@router.post("/answer")
+async def next_question(
+    answer_obj: AnswerObj,
+    request: Request,
+    cursor=Depends(get_cursor)
+):
+    """
+    Modernized endpoint that preserves the complete legacy logic,
+    with full error handling and rich logging.
+    """
+    request_id_ctx_var.set(request.state.request_id)
+    logger.info(f"[{request.state.request_id}] /answer called for User ID: {answer_obj.userId}, Q: {answer_obj.question}")
+
+    try:
+        answer_cleaned = answer_obj.answer.rstrip().removesuffix("Play.").strip()
+        logger.debug(f"Cleaned answer: {answer_cleaned}")
+
+        # 1. Check for incomplete/intermediate answer
+        await cursor.execute(
+            'SELECT question, question_type, answer FROM intermediate_conv WHERE userid=?',
+            (answer_obj.userId,)
+        )
+        int_ans_det = await cursor.fetchone()
+        logger.debug(f"Fetched intermediate_conv: {int_ans_det}")
+
+        if int_ans_det:
+            await cursor.execute('DELETE FROM intermediate_conv WHERE userid=?', (answer_obj.userId,))
+            logger.info(f"Deleted intermediate answer for {answer_obj.userId}")
+
+        # 2. Handle repeat question logic
+        await cursor.execute(
+            'SELECT TOP 1 question FROM questions_list WITH (NOLOCK) WHERE interview_user_id=? AND [quest_status]=2 ORDER BY queid',
+            (answer_obj.userId,)
+        )
+        repeat_ques_det = await cursor.fetchone()
+        logger.debug(f"Repeat question check: {repeat_ques_det}")
+
+        if repeat_ques_det:
+            if int_ans_det:
+                int_ques, int_ques_type, int_ans = int_ans_det
+                answer_full = (int_ans or "") + answer_cleaned
+                last_word = answer_full.strip().split()[-1].replace('.', '') if answer_full.strip() else ""
+                logger.debug(f"Repeat branch: answer_full={answer_full}, last_word={last_word}")
+
+                if last_word.lower() in ['and', 'but', 'thinking', 'think']:
+                    await cursor.execute(
+                        'INSERT INTO intermediate_conv(userid, question, answer, question_type) VALUES (?, ?, ?, ?)',
+                        (answer_obj.userId, int_ques, answer_full, int_ques_type)
+                    )
+                    logger.info("Repeat: Incomplete answer, saved to intermediate_conv")
+                else:
+                    await cursor.execute(
+                        'INSERT INTO interview_conversation(interview_user_id, question, answer_given, question_type, creation_date) VALUES (?, ?, ?, ?, ?)',
+                        (answer_obj.userId, int_ques, answer_full, int_ques_type, datetime.now())
+                    )
+                    logger.info("Repeat: Complete answer, saved to interview_conversation")
+                await cursor.commit()
+            return {"question": repeat_ques_det[0], "question_type": answer_obj.question_type}
+
+        # 3. Composite/incomplete answer validation (LLM)
+        if int_ans_det:
+            int_ques, int_ques_type, int_ans = int_ans_det
+            logger.info(f"Validating composite answer for User ID: {answer_obj.userId}")
+            answercheckdet = validate_answer_comp(int_ques, int_ans)
+            logger.debug(f"validate_answer_comp result: {answercheckdet}")
+
+            if answercheckdet.get("completion_flag") == "1":
+                await cursor.execute(
+                    'INSERT INTO interview_conversation(interview_user_id, question, answer_given, question_type, creation_date) VALUES (?, ?, ?, ?, ?)',
+                    (answer_obj.userId, int_ques, int_ans, int_ques_type, datetime.now())
+                )
+                await cursor.commit()
+                logger.info("Composite answer: marked as complete, saved to interview_conversation")
+
+                await cursor.execute('''
+                    UPDATE questions_list SET quest_status=1
+                    WHERE queid = (
+                        SELECT TOP 1 queid FROM questions_list WHERE interview_user_id=? AND quest_status=2 ORDER BY queid
+                    )
+                ''', (answer_obj.userId,))
+                await cursor.commit()
+                logger.info("Updated questions_list status after composite answer")
+            else:
+                await cursor.execute(
+                    'INSERT INTO intermediate_conv(userid, question, answer, question_type) VALUES (?, ?, ?, ?)',
+                    (answer_obj.userId, int_ques, int_ans, int_ques_type)
+                )
+                await cursor.commit()
+                logger.info("Composite answer: not complete, saved to intermediate_conv")
+                return {"question": "Please go ahead", "question_type": int_ques_type}
+
+        # 4. Next question branch (not repeat, not composite)
+        await cursor.execute(
+            'SELECT TOP 1 question, question_type FROM questions_list WHERE interview_user_id=? AND quest_status=0 ORDER BY queid',
+            (answer_obj.userId,)
+        )
+        next_ques_det = await cursor.fetchone()
+        logger.debug(f"Next question fetch: {next_ques_det}")
+
+        if next_ques_det:
+            next_ques, next_ques_type = next_ques_det
+            await cursor.execute('''
+                UPDATE questions_list SET quest_status=1
+                WHERE queid = (
+                    SELECT TOP 1 queid FROM questions_list WHERE interview_user_id=? AND quest_status=0 ORDER BY queid
+                )
+            ''', (answer_obj.userId,))
+            await cursor.commit()
+            logger.info(f"Marked as asked: question={next_ques} for User ID: {answer_obj.userId}")
+
+            if next_ques_type != answer_obj.question_type:
+                if 'no issues' not in next_ques.lower():
+                    next_ques = f"Let's evaluate {next_ques_type} fitment now. {next_ques}"
+            return {"question": next_ques, "question_type": next_ques_type}
+
+        # 5. End of questions: Save to intermediate_conv (if anything left)
+        await cursor.execute(
+            'SELECT question, question_type, answer FROM intermediate_conv WHERE userid=?',
+            (answer_obj.userId,)
+        )
+        int_ans_det = await cursor.fetchone()
+        logger.debug(f"Post-loop intermediate_conv check: {int_ans_det}")
+
+        if int_ans_det:
+            await cursor.execute(
+                'INSERT INTO intermediate_conv(userid, question, answer, question_type) VALUES (?, ?, ?, ?)',
+                (answer_obj.userId, int_ans_det[0], answer_cleaned, int_ans_det[1])
+            )
+            await cursor.commit()
+            logger.info(f"End: saved incomplete answer to intermediate_conv for User ID: {answer_obj.userId}")
+        else:
+            await cursor.execute(
+                'INSERT INTO intermediate_conv(userid, question, answer, question_type) VALUES (?, ?, ?, ?)',
+                (answer_obj.userId, answer_obj.question, answer_cleaned, answer_obj.question_type)
+            )
+            await cursor.commit()
+            logger.info(f"End: saved fresh incomplete answer to intermediate_conv for User ID: {answer_obj.userId}")
+
+        logger.info(f"End of questions for User ID: {answer_obj.userId}")
+        return {
+            "question": "Thanks for your time today. We will get back to you soon with the next steps. Have a great day!",
+            "question_type": "End"
+        }
+
+    except Exception as e:
+        logger.error(f"Exception in /answer for User ID: {answer_obj.userId}\n{traceback.format_exc()}")
+        await cursor.rollback()
+        log_and_raise("Error processing answer/next question.", e)
