@@ -1,0 +1,181 @@
+# app/llm/llm_service.py
+
+import json
+import asyncio
+from typing import Any, Dict
+from azure.identity.aio import EnvironmentCredential
+from openai import AzureOpenAI, OpenAIError
+from app.config import config
+from app.prompts.prompt_store import (
+    get_quest_prompt,
+    validate_answer_prompt,
+    validate_answer_completion_prompt,
+    interview_evaluation_prompt
+)
+from app.models.schemas import (
+    LLMQuestionList,
+    LLMAnswerCheck,
+    LLMNextQuesDet,
+    LLMTranscriptVal
+)
+from app.logger import logger
+
+class LLMService:
+    def __init__(self):
+        try:
+            self.credential = EnvironmentCredential()
+            self.api_base = config.AZURE_OPENAI_ENDPOINT
+            self.api_version = config.AZURE_OPENAI_API_VERSION
+            logger.info("Azure OpenAI keyless (AAD) client ready (credential initialized).")
+        except Exception as e:
+            logger.exception(f"Failed to initialize Azure OpenAI keyless client: {e}")
+            raise
+
+    async def _get_access_token(self) -> str:
+        try:
+            token = await self.credential.get_token("https://cognitiveservices.azure.com/.default")
+            logger.debug("[TOKEN] Azure AD access token obtained.")
+            return token.token
+        except Exception as e:
+            logger.exception("[TOKEN] Failed to obtain Azure AD access token.")
+            raise RuntimeError("Azure AD token fetch failed.") from e
+
+    async def _call_llm(self, model: str, messages: list, response_format: str) -> Any:
+        try:
+            access_token = await self._get_access_token()
+            client = AzureOpenAI(
+                azure_endpoint=self.api_base,
+                api_version=self.api_version,
+                azure_ad_token=access_token,
+            )
+            logger.info(f"[LLM] Calling model: {model}, response_format: {response_format}")
+            result = await asyncio.to_thread(
+                client.beta.chat.completions.create,
+                model=model,
+                messages=messages,
+                response_format=response_format
+            )
+            logger.info(f"[LLM] Response received.")
+            return result
+        except OpenAIError as oe:
+            logger.error(f"AzureOpenAI API Error: {oe}")
+            raise
+        except Exception as e:
+            logger.exception(f"Exception during AzureOpenAI API call: {e}")
+            raise
+
+    @staticmethod
+    def _parse_llm_response(resp: str) -> dict:
+        try:
+            resp = resp.replace("```json", "").replace("```", "").strip()
+            return json.loads(resp)
+        except Exception:
+            logger.warning(f"LLM raw response not valid JSON: {resp!r}")
+            start, end = resp.find("{"), resp.rfind("}")
+            if 0 <= start < end:
+                try:
+                    return json.loads(resp[start:end+1])
+                except Exception as e2:
+                    logger.error(f"LLM response extraction failed: {e2}")
+            raise ValueError("Unable to parse LLM response to JSON.")
+
+    async def get_question_list(self, job_description: str, resume: str) -> Dict:
+        logger.info("Requesting question list from LLM (keyless)...")
+        prompt = f"Job Description\n{job_description}\nResume\n{resume}\n"
+        messages = [
+            {"role": "system", "content": get_quest_prompt},
+            {"role": "user", "content": prompt}
+        ]
+        try:
+            response = await self._call_llm(
+                model=config.AZURE_OPENAI_DEPLOYMENT,
+                messages=messages,
+                response_format="QuestionList"
+            )
+            content = response.choices[0].message.content
+            parsed = self._parse_llm_response(content)
+            LLMQuestionList(**parsed)  # Validate with Pydantic
+            logger.info("LLM question list parsed and validated successfully.")
+            return parsed
+        except Exception as e:
+            logger.error(f"Error in get_question_list: {e}")
+            raise
+
+    async def validate_answer(self, question: str, answer: str, next_question: str) -> Dict:
+        logger.info("Requesting answer validation from LLM (keyless)...")
+        prompt = (
+            f"Question asked to candidate:\n{question}\n"
+            f"Answer by candidate\n{answer}\n"
+            f"Next Question:\n{next_question}\n"
+        )
+        messages = [
+            {"role": "system", "content": validate_answer_prompt},
+            {"role": "user", "content": prompt}
+        ]
+        try:
+            response = await self._call_llm(
+                model=config.AZURE_OPENAI_DEPLOYMENT,
+                messages=messages,
+                response_format="nextquesdet"
+            )
+            content = response.choices[0].message.content
+            parsed = self._parse_llm_response(content)
+            LLMNextQuesDet(**parsed)
+            logger.info("LLM answer validation response parsed and validated successfully.")
+            return parsed
+        except Exception as e:
+            logger.error(f"Error in validate_answer: {e}")
+            raise
+
+    async def validate_answer_comp(self, question: str, answer: str) -> Dict:
+        logger.info("Requesting answer completion check from LLM (keyless)...")
+        prompt = (
+            f"Question asked to candidate:\n{question}\n"
+            f"Answer by candidate\n{answer}\n"
+        )
+        messages = [
+            {"role": "system", "content": validate_answer_completion_prompt},
+            {"role": "user", "content": prompt}
+        ]
+        try:
+            response = await self._call_llm(
+                model=config.AZURE_OPENAI_DEPLOYMENT,
+                messages=messages,
+                response_format="answercheckdet"
+            )
+            content = response.choices[0].message.content
+            parsed = self._parse_llm_response(content)
+            LLMAnswerCheck(**parsed)
+            logger.info("LLM answer completion check parsed and validated successfully.")
+            return parsed
+        except Exception as e:
+            logger.error(f"Error in validate_answer_comp: {e}")
+            raise
+
+    async def evaluate_interview_detailed(self, eval_input: dict) -> Dict:
+        logger.info("Requesting detailed interview evaluation from LLM (keyless)...")
+        conversation_str = '\n'.join([json.dumps(item) for item in eval_input['conversation']])
+        prompt = (
+            f"Transcript category\n{eval_input['question_type']}\n"
+            f"Convesation Transcript\n{conversation_str}"
+        )
+        messages = [
+            {"role": "system", "content": interview_evaluation_prompt},
+            {"role": "user", "content": prompt}
+        ]
+        try:
+            response = await self._call_llm(
+                model=config.AZURE_OPENAI_DEPLOYMENT,
+                messages=messages,
+                response_format="transcriptval"
+            )
+            content = response.choices[0].message.content
+            parsed = self._parse_llm_response(content)
+            LLMTranscriptVal(**parsed)
+            logger.info("LLM transcript evaluation parsed and validated successfully.")
+            return parsed
+        except Exception as e:
+            logger.error(f"Error in evaluate_interview_detailed: {e}")
+            raise
+
+llm_service = LLMService()
