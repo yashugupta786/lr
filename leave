@@ -1,0 +1,122 @@
+from typing import Annotated, List
+from typing_extensions import TypedDict
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from langgraph.graph import StateGraph, END
+from langgraph.graph.message import add_messages
+from langgraph.prebuilt import ToolNode, tools_condition
+from langchain.chat_models import init_chat_model
+from datetime import datetime, timedelta
+import dateparser
+import os
+os.environ["AZURE_OPENAI_API_KEY"] =""
+os.environ["AZURE_OPENAI_ENDPOINT"] = ""
+os.environ["OPENAI_API_VERSION"] = ""
+
+# --- TOOL 1: Mark Attendance ---
+def mark_attendance(lanid: str, day: str):
+    """Mark attendance for an employee for today or yesterday.
+    Args:
+        lanid: Employee LAN ID (e.g., 'yashu258173').
+        day: 'today' or 'yesterday'.
+    Returns confirmation string.
+    """
+    date_str = (datetime.now() if day.lower() == "today" else datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    print(f"[TOOL CALLED] Marked attendance for {lanid} on {date_str}")
+    return f"Attendance marked for {lanid} on {date_str}."
+
+# --- TOOL 2: Apply Leave (only after confirmation) ---
+def apply_leave(lanid: str, leave_type: str, from_date: str, to_date: str):
+    """
+    Apply for leave for an employee.
+    Args:
+        lanid: Employee LAN ID (e.g., 'yashu258173').
+        leave_type: Type of leave. One of: 'SL' (Sick Leave), 'PL' (Privilege Leave), 'CL' (Casual Leave)
+        from_date: Leave start date in 'YYYY-MM-DD'
+        to_date: Leave end date in 'YYYY-MM-DD'
+    Returns confirmation string.
+    """
+    leave_type_full = {'SL': 'Sick Leave', 'PL': 'Privilege Leave', 'CL': 'Casual Leave'}.get(leave_type, leave_type)
+    print(f"[TOOL CALLED] {lanid} applied for {leave_type} leave from {from_date} to {to_date}")
+    return f"{leave_type_full} successfully applied for {lanid} from {from_date} to {to_date}."
+
+# --- TOOL 3: Resolve Date (calendar/date parsing tool) ---
+def resolve_date(date_natural: str):
+    """
+    Convert a natural language date (like 'today', 'tomorrow', '26 of July', etc.) to YYYY-MM-DD format.
+    Uses the current year if year is not mentioned.
+    Returns YYYY-MM-DD string or an error message if unresolvable.
+    """
+    dt = dateparser.parse(date_natural, settings={'PREFER_DATES_FROM': 'future'})
+    if not dt:
+        return f"Could not resolve '{date_natural}'. Please provide in YYYY-MM-DD format."
+    return dt.strftime("%Y-%m-%d")
+
+tools = [mark_attendance, apply_leave, resolve_date]
+
+# --- STATE ---
+class State(TypedDict):
+    messages: Annotated[List[HumanMessage | AIMessage | SystemMessage], add_messages]
+
+# --- LLM ---
+model = init_chat_model(
+    "azure_openai:gpt-4o",
+    azure_deployment="gpt-4o"  # Use your Azure deployment name if needed!
+    # api_key="YOUR_AZURE_KEY",
+    # base_url="https://YOUR_RESOURCE.openai.azure.com/",
+    # api_version="2024-02-15-preview",
+)
+model_with_tools = model.bind_tools(tools)
+
+SYSTEM_PROMPT = (
+    "You are EXL's official HR Assistant Bot for Planet Portal. You can ONLY do two things, using the available tools:\n"
+    "1. Mark attendance for employees for today or yesterday (using the mark_attendance tool). Prompt for LAN ID and day if either is missing. If user provides other dates, politely say only today/yesterday are allowed.\n"
+    "2. Apply for leave (using the apply_leave tool). Supported leave types are Sick Leave (SL), Privilege Leave (PL), and Casual Leave (CL). You must collect all four values from the user: LAN ID, leave type (SL/PL/CL), from_date, and to_date. If a date is missing or ambiguous (e.g. 'today', '26 July', 'tomorrow'), ALWAYS resolve to YYYY-MM-DD using the resolve_date tool. Use the current year for any month-day-only input, unless otherwise specified by the user.\n"
+    "Before calling apply_leave, ALWAYS confirm the leave details with the user in this format: "
+    "'You want to apply [leave type] for LAN ID [lanid] from [from_date] to [to_date]. Should I proceed?' Only proceed after user confirmation.\n"
+    "If a user asks anything else, refuses to give info, or asks about salary, bonus, policies, etc., respond: "
+    "'Sorry, I can only help you with attendance marking and leave application.'\n"
+    "Always use the tools for actions—never answer with text directly. Always ensure user inputs are explicit and unambiguous before taking action."
+)
+
+def agent_node(state: State):
+    msgs = [SystemMessage(content=SYSTEM_PROMPT)] + state["messages"]
+    response = model_with_tools.invoke(msgs)
+    return {"messages": [response]}
+
+# --- GRAPH ---
+graph_builder = StateGraph(State)
+graph_builder.add_node("agent", agent_node)
+graph_builder.add_node("tools", ToolNode(tools=tools))
+graph_builder.add_conditional_edges(
+    "agent",
+    tools_condition,
+    path_map={"tools": "tools", "end": END, "__end__": END}
+)
+graph_builder.add_edge("tools", "agent")
+graph_builder.set_entry_point("agent")
+graph = graph_builder.compile()
+
+# --- MAIN LOOP ---
+def main():
+    print("=== EXL HR REAct Agent (Attendance + Leave, Smart Date) ===")
+    print("Type 'exit' to quit.\n")
+    memory = []
+    while True:
+        user_input = input("User: ")
+        if user_input.lower() in ("exit", "quit", "q"):
+            print("Goodbye!")
+            break
+        memory.append(HumanMessage(content=user_input))
+        response_text = ""
+        for msg in graph.stream({"messages": memory}):
+            if isinstance(msg, dict):
+                ai_msg = msg.get("agent", {}).get("messages", [None])[0]
+                if ai_msg and hasattr(ai_msg, "content") and ai_msg.content:
+                    response_text = ai_msg.content
+            elif hasattr(msg, "content") and msg.content:
+                response_text = msg.content
+        print("Assistant:", response_text)
+        memory.append(AIMessage(content=response_text))
+
+if __name__ == "__main__":
+    main()
