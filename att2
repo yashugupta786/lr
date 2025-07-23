@@ -1,0 +1,177 @@
+from typing import Annotated, List, Optional
+from typing_extensions import TypedDict
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from langgraph.graph import StateGraph, END
+from langgraph.graph.message import add_messages
+from langgraph.prebuilt import ToolNode, tools_condition
+from langchain.chat_models import init_chat_model
+from datetime import datetime
+import dateparser
+import os
+
+# ---- Azure OpenAI Environment Variables (use env vars or config in prod) ----
+os.environ["AZURE_OPENAI_API_KEY"] = ""
+os.environ["AZURE_OPENAI_ENDPOINT"] = ""
+os.environ["OPENAI_API_VERSION"] = ""
+
+# ---- State Schema ----
+class State(TypedDict):
+    messages: Annotated[List[HumanMessage | AIMessage | SystemMessage], add_messages]
+
+# ---- Agent Class ----
+class HRChatAgent:
+    def __init__(self, lanid: str):
+        """
+        Initialize HRChatAgent with the authenticated user's LAN ID.
+        """
+        self.lanid = lanid
+        self.model = init_chat_model(
+            "azure_openai:gpt-4o",
+            azure_deployment="gpt-4o"
+        )
+        self.tools = self.make_tools_for_user(lanid)
+        self.model_with_tools = self.model.bind_tools(self.tools)
+        self.graph = self._build_graph()
+
+    # ---- Tool 1: Date Resolver ----
+    @staticmethod
+    def resolve_date(date_natural: str) -> Optional[str]:
+        """
+        Convert any natural language date (e.g., 'today', '22 July', 'tuesday 22 july', '2025-07-22', '22/07', etc.)
+        to YYYY-MM-DD using system's current year if year is not provided.
+        Returns a string in 'YYYY-MM-DD' format if resolved, None if not resolvable.
+        """
+        now = datetime.now()
+        dt = dateparser.parse(date_natural, settings={'RELATIVE_BASE': now, 'PREFER_DATES_FROM': 'current_period'})
+        if not dt:
+            dt = dateparser.parse(f"{date_natural} {now.year}", settings={'RELATIVE_BASE': now})
+        if not dt:
+            return None
+        user_provided_year = any(str(year) in date_natural for year in range(now.year-3, now.year+4))
+        if not user_provided_year and dt.year != now.year:
+            dt = dt.replace(year=now.year)
+        return dt.strftime("%Y-%m-%d")
+
+    # ---- Tool 2: Mark Attendance (today only) ----
+    def mark_attendance(self, date_str: str) -> str:
+        """
+        Mark attendance for the user for TODAY ONLY (or if user-provided date resolves to today).
+        Args:
+            date_str: Date as entered by user (any format)
+        Returns:
+            Success message if attendance marked, polite refusal otherwise.
+        """
+        resolved_date = self.resolve_date(date_str)
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        print(f"DEBUG: System today: {repr(today_str)} | User input: '{date_str}' -> Resolved: {repr(resolved_date)}")
+        if not resolved_date:
+            return f"Could not resolve the date '{date_str}'. Please specify a clear date like 'today' or '22 July'."
+        if resolved_date.strip() != today_str.strip():
+            return f"Sorry, you can only mark attendance for today ({today_str})."
+        print(f"[TOOL CALLED] Marked attendance for {self.lanid} on {today_str}")
+        return f"Attendance marked for {self.lanid} on {today_str}."
+
+    # ---- Tool 3: Apply Leave (dates always resolved first) ----
+    def apply_leave(self, leave_type: str, from_date: str, to_date: str) -> str:
+        """
+        Apply for leave for the user. Dates will be resolved using the calendar tool.
+        Args:
+            leave_type: Leave type ('SL', 'PL', 'CL')
+            from_date: Start date (natural language)
+            to_date: End date (natural language)
+        Returns:
+            Confirmation message if dates are resolved, refusal otherwise.
+        """
+        leave_type_full = {'SL': 'Sick Leave', 'PL': 'Privilege Leave', 'CL': 'Casual Leave'}.get(leave_type.upper(), leave_type)
+        resolved_from = self.resolve_date(from_date)
+        resolved_to = self.resolve_date(to_date)
+        if not resolved_from or not resolved_to:
+            return f"Could not resolve one or both leave dates. Please specify clearly (e.g., 'today', '25 July')."
+        print(f"[TOOL CALLED] {self.lanid} applied for {leave_type_full} from {resolved_from} to {resolved_to}")
+        return f"{leave_type_full} successfully applied for {self.lanid} from {resolved_from} to {resolved_to}."
+
+    # ---- Tool Factory (wrappers with bound LANID) ----
+    def make_tools_for_user(self, lanid):
+        def attendance_wrapper(date_str):
+            return self.mark_attendance(date_str)
+        attendance_wrapper.__doc__ = self.mark_attendance.__doc__
+
+        def leave_wrapper(leave_type, from_date, to_date):
+            return self.apply_leave(leave_type, from_date, to_date)
+        leave_wrapper.__doc__ = self.apply_leave.__doc__
+
+        return [
+            self.resolve_date,       # no LANID needed, user input only
+            attendance_wrapper,      # LANID injected by class
+            leave_wrapper            # LANID injected by class
+        ]
+
+    # ---- LangGraph Node ----
+    def agent_node(self, state: State):
+        msgs = [SystemMessage(content=self.system_prompt())] + state["messages"]
+        response = self.model_with_tools.invoke(msgs)
+        return {"messages": [response]}
+
+    # ---- System Prompt ----
+    @staticmethod
+    def system_prompt():
+        return (
+            "You are EXL's HR Assistant Bot. Strictly follow these rules:\n"
+            "1. For attendance, always collect the date (in any format), resolve it using the calendar tool, and call the mark_attendance tool. LAN ID is always handled by the system, never ask the user for it.\n"
+            "2. For leave, collect leave type (SL, PL, CL), from and to dates (resolve with calendar), and call the apply_leave tool. LAN ID is handled by system, never ask.\n"
+            "3. Never answer any other questions (salary, policies, etc.)—reply with: 'Sorry, I can only help with attendance marking for today and leave applications.'\n"
+            "4. For ambiguous or invalid dates, ask the user to clarify and provide a correct date.\n"
+            "5. If you need LAN ID, it is automatically provided—never ask the user for it."
+        )
+
+    # ---- LangGraph Setup ----
+    def _build_graph(self):
+        graph_builder = StateGraph(State)
+        graph_builder.add_node("agent", self.agent_node)
+        graph_builder.add_node("tools", ToolNode(tools=self.tools))
+        graph_builder.add_conditional_edges(
+            "agent",
+            tools_condition,
+            path_map={"tools": "tools", "end": END, "__end__": END}
+        )
+        graph_builder.add_edge("tools", "agent")
+        graph_builder.set_entry_point("agent")
+        return graph_builder.compile()
+
+    # ---- Conversation Run Method ----
+    def run_chat(self, user_messages: List[str]):
+        """
+        Run a chat session with a list of user messages. Returns the bot response.
+        Can be called from API or CLI.
+        """
+        memory = []
+        for user_input in user_messages:
+            memory.append(HumanMessage(content=user_input))
+            response_text = ""
+            for msg in self.graph.stream({"messages": memory}):
+                if isinstance(msg, dict):
+                    ai_msg = msg.get("agent", {}).get("messages", [None])[0]
+                    if ai_msg and hasattr(ai_msg, "content") and ai_msg.content:
+                        response_text = ai_msg.content
+                elif hasattr(msg, "content") and msg.content:
+                    response_text = msg.content
+            memory.append(AIMessage(content=response_text))
+        return response_text
+
+# ---- CLI DEMO FOR TESTING ----
+def main():
+    print("=== EXL HR REAct Agent (Attendance/Leave, Per-user, Modular Class) ===")
+    lanid = input("Enter your LAN ID (SSO simulation): ").strip()
+    agent = HRChatAgent(lanid=lanid)
+    memory = []
+    while True:
+        user_input = input("User: ")
+        if user_input.lower() in ("exit", "quit", "q"):
+            print("Goodbye!")
+            break
+        memory.append(user_input)
+        response = agent.run_chat([user_input])
+        print("Assistant:", response)
+
+if __name__ == "__main__":
+    main()
