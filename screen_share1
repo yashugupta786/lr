@@ -1,0 +1,325 @@
+import asyncio
+import json
+import os
+import base64
+import datetime
+from google import genai
+from google.genai import types
+
+from websockets.server import WebSocketServerProtocol
+import websockets.server
+
+from llama_index.core import (
+    VectorStoreIndex,
+    SimpleDirectoryReader,
+    StorageContext,
+    load_index_from_storage,
+    Settings,
+)
+from llama_index.embeddings.gemini import GeminiEmbedding
+from llama_index.llms.gemini import Gemini
+
+# ---------- PDF Indexing (RAG) ------------
+os.environ['GOOGLE_API_KEY'] = "AIzaSyBiJbSx0soDeblOIU6n5ShMjdOFLmMvdzQ"
+gemini_api_key = os.environ['GOOGLE_API_KEY']
+MODEL = "gemini-2.0-flash-live-001"
+PDF_PATH = r"D:\gemini-poc\gemini_live\test_doc.pdf"
+PERSIST_DIR = "./planet_storage"
+
+def build_index():
+    Settings.llm = Gemini(api_key=gemini_api_key, model_name="models/gemini-2.5-flash")
+    Settings.embed_model = GeminiEmbedding(api_key=gemini_api_key, model_name="models/gemini-embedding-001")
+    if not os.path.exists(PERSIST_DIR):
+        documents = SimpleDirectoryReader(input_files=[PDF_PATH]).load_data()
+        index = VectorStoreIndex.from_documents(documents)
+        index.storage_context.persist(persist_dir=PERSIST_DIR)
+    else:
+        storage_context = StorageContext.from_defaults(persist_dir=PERSIST_DIR)
+        index = load_index_from_storage(storage_context)
+    return index
+
+PLANET_INDEX = build_index()
+
+async def query_planet_doc_async(query: str):
+    loop = asyncio.get_event_loop()
+    def run_query():
+        query_engine = PLANET_INDEX.as_query_engine()
+        response = query_engine.query(query)
+        return str(response)
+    return await loop.run_in_executor(None, run_query)
+
+# ---------- Tool (Function) Declaration -----
+planet_tool = {
+    "function_declarations": [
+        {
+            "name": "planet_query",
+            "description": "Answer user queries based on the EXL PLANET SOP PDF (attendance, insurance, cyber security, etc).",
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {
+                    "query": {
+                        "type": "STRING",
+                        "description": "The user's question related to EXL PLANET policies or steps."
+                    }
+                },
+                "required": ["query"]
+            }
+        }
+    ]
+}
+
+# ---------- Session Handle Persistence ------
+def load_previous_session_handle():
+    try:
+        with open('session_handle.json', 'r') as f:
+            data = json.load(f)
+            print(f"Loaded previous session handle: {data.get('previous_session_handle', None)}")
+            return data.get('previous_session_handle', None)
+    except FileNotFoundError:
+        return None
+
+def save_previous_session_handle(handle):
+    with open('session_handle.json', 'w') as f:
+        json.dump({'previous_session_handle': handle}, f)
+
+previous_session_handle = load_previous_session_handle()
+
+CONTEXT_COMPRESSION = types.ContextWindowCompressionConfig(
+    sliding_window=types.SlidingWindow(),
+)
+
+# ---------- Gemini WebSocket Server ----------
+client = genai.Client(http_options={"api_version": "v1alpha"})
+
+async def gemini_session_handler(websocket: WebSocketServerProtocol):
+    print(f"Starting Gemini session")
+    global previous_session_handle
+    try:
+        config_message = await websocket.recv()
+        config_data = json.loads(config_message)
+
+        config = types.LiveConnectConfig(
+            response_modalities=["AUDIO"],  # Or "TEXT" if you only want text response
+            speech_config=types.SpeechConfig(
+                voice_config=types.VoiceConfig(
+                    prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Kore")
+                    # or other voices: Puck, Charon, etc.
+                ),
+                language_code='en-US',  # Set your preferred language
+            ),
+            system_instruction=(""" You are a smart, context-aware EXL enterprise assistant.
+
+**TOOL USAGE RULES** (follow strictly):
+- ONLY call the planet_query tool if:
+    1. The SCREEN IMAGE you receive is clearly from the EXL portal or an EXL enterprise app (attendance, leave, HR, etc), AND
+    2. The user's AUDIO or TEXT question is about attendance, leave, EXL policy, or EXL HR matters, AND
+    3. BOTH (1) and (2) are TRUE at the same time.
+
+- If EITHER the image is NOT an EXL portal/app, OR the user's question is about anything else (not EXL attendance/leave/HR), then DO NOT call the tool. Instead, answer using your own knowledge.
+
+**STRICT EXAMPLES:**
+- Example 1: If the image is a social media page and the user asks about EXL leave—DO NOT CALL the tool.
+- Example 2: If the image is EXL portal, but user asks about cricket scores—DO NOT CALL the tool.
+- Example 3: If both are related to EXL, THEN call the tool.
+- Example 4: if image is related to something else but user asking some other thing you should answer.
+- Example 5: For EXL specific info you should consider image and audio while answering. 
+
+Never hallucinate tool use. If you are unsure, DO NOT call the tool. Never speak internal tool_outputs or JSON. Only answer conversationally to the user.
+
+If the user's input is unclear or mismatched with the image, politely clarify before acting."""),
+            tools=[planet_tool],  # (defined earlier for tool calling)
+            session_resumption=types.SessionResumptionConfig(
+                handle=previous_session_handle  # (defined via load_previous_session_handle)
+            ),
+            output_audio_transcription=types.AudioTranscriptionConfig(),  # enable audio output transcription
+            # --- ADVANCED VAD (Voice Activity Detection) ---
+            realtime_input_config=types.RealtimeInputConfig(
+                automatic_activity_detection=types.AutomaticActivityDetection(
+                    disabled=False,  # Keep auto-VAD
+                    start_of_speech_sensitivity=types.StartSensitivity.START_SENSITIVITY_LOW,  # Tweak as needed
+                    end_of_speech_sensitivity=types.EndSensitivity.END_SENSITIVITY_LOW,  # Tweak as needed
+                    prefix_padding_ms=10,
+                    silence_duration_ms=80,
+                )
+            ),
+            # --- Context Window Compression  ---
+            # context_window_compression=types.ContextWindowCompressionConfig(
+            #     sliding_window=types.SlidingWindow()
+            # ),
+            # --- Media Resolution (optional, for image input size tuning) ---
+            # media_resolution=types.MediaResolution.MEDIA_RESOLUTION_LOW,
+        )
+
+        async with client.aio.live.connect(model=MODEL, config=config) as session:
+            tool_call_task = None
+            last_activity = datetime.datetime.now()
+
+            greeted = False
+
+            async def send_to_gemini():
+
+                nonlocal tool_call_task, last_activity, greeted
+                try:
+                    # GREETING = "Hi! I am ready to help you with EXL attendance, policy, or HR questions. You can speak or share your screen anytime."
+                    #
+                    # if not greeted:
+                    #     # Send initial greeting as user turn so that model greets vocally
+                    #     await session.send_client_content(
+                    #         turns=types.Content(role="user", parts=[types.Part(text=GREETING)])
+                    #     )
+                    #     greeted = True
+                    async for message in websocket:
+                        data = json.loads(message)
+                        last_activity = datetime.datetime.now()
+                        if "realtime_input" in data:
+                            for chunk in data["realtime_input"]["media_chunks"]:
+                                if chunk["mime_type"] == "audio/pcm":
+                                    await session.send(input={
+                                        "mime_type": "audio/pcm",
+                                        "data": chunk["data"]
+                                    })
+                                elif chunk["mime_type"].startswith("image/"):
+                                    await session.send(input={
+                                        "mime_type": chunk["mime_type"],
+                                        "data": chunk["data"]
+                                    })
+                        elif "text" in data:
+                            await session.send(input={
+                                "mime_type": "text/plain",
+                                "data": data["text"]
+                            })
+                except Exception as e:
+                    print(f"Error sending to Gemini: {e}")
+
+            async def receive_from_gemini():
+                nonlocal tool_call_task, last_activity
+                global previous_session_handle
+
+                try:
+                    while True:
+                        async for response in session.receive():
+                            # 1. Session ending warning (GoAway)
+                            if hasattr(response, "go_away") and response.go_away is not None:
+                                print(f"[WARNING] Session ending soon, time left: {response.go_away.time_left} seconds")
+
+                            # 2. Handle interruption immediately
+                            if (
+                                response.server_content
+                                and hasattr(response.server_content, 'interrupted')
+                                and response.server_content.interrupted is not None
+                            ):
+                                print(f"[{datetime.datetime.now()}] Generation interrupted")
+                                await websocket.send(json.dumps({"interrupted": "True"}))
+                                if tool_call_task and not tool_call_task.done():
+                                    tool_call_task.cancel()
+                                    print("[TOOL CALL] RAG query task cancelled due to interruption")
+                                continue
+
+                            # 3. Session handle update
+                            if response.session_resumption_update:
+                                update = response.session_resumption_update
+                                if update.resumable and update.new_handle:
+                                    previous_session_handle = update.new_handle
+                                    save_previous_session_handle(previous_session_handle)
+                                    print(f"Resumed session update with handle: {previous_session_handle}")
+
+                            # 4. Usage metadata
+                            if response.usage_metadata:
+                                usage = response.usage_metadata
+                                print(f'Used {usage.total_token_count} tokens in total.')
+
+                            # 5. Tool call (RAG)
+                            if response.server_content is None and response.tool_call is not None:
+                                for fc in response.tool_call.function_calls:
+                                    if fc.name == "planet_query":
+                                        query = fc.args["query"]
+                                        print(f"[TOOL CALL] Tool: planet_query, Query: {query}")
+
+                                        async def rag_tool_runner():
+                                            try:
+                                                answer = await query_planet_doc_async(query)
+                                                tool_response = types.FunctionResponse(
+                                                    id=fc.id,
+                                                    name=fc.name,
+                                                    response={"result": answer}
+                                                )
+                                                await session.send_tool_response(function_responses=[tool_response])
+                                            except asyncio.CancelledError:
+                                                print("[TOOL CALL] Tool RAG task was cancelled/interrupted.")
+                                        tool_call_task = asyncio.create_task(rag_tool_runner())
+                                        await tool_call_task
+                                continue
+
+                            # 6. Audio/text streaming and transcription
+                            if response.server_content:
+                                # Transcription output (optional)
+                                if hasattr(response.server_content, 'output_transcription') and response.server_content.output_transcription is not None:
+                                    await websocket.send(json.dumps({
+                                        "transcription": {
+                                            "text": response.server_content.output_transcription.text,
+                                            "sender": "Gemini",
+                                            "finished": response.server_content.output_transcription.finished
+                                        }
+                                    }))
+                                if hasattr(response.server_content, 'input_transcription') and response.server_content.input_transcription is not None:
+                                    await websocket.send(json.dumps({
+                                        "transcription": {
+                                            "text": response.server_content.input_transcription.text,
+                                            "sender": "User",
+                                            "finished": response.server_content.input_transcription.finished
+                                        }
+                                    }))
+                                # Main model turn
+                                model_turn = response.server_content.model_turn
+                                if model_turn:
+                                    for part in model_turn.parts:
+                                        # Don't repeat "tool_outputs" etc.
+                                        if hasattr(part, 'text') and part.text is not None:
+                                            filtered = part.text
+                                            # Filter out tool_outputs text if present (shouldn't, but just in case)
+                                            if filtered.strip().lower().startswith("tool_outputs"):
+                                                filtered = ""
+                                            if filtered:
+                                                await websocket.send(json.dumps({"text": filtered}))
+                                        elif hasattr(part, 'inline_data') and part.inline_data is not None:
+                                            audio_data = part.inline_data.data
+                                            base64_audio = base64.b64encode(audio_data).decode('utf-8')
+                                            await websocket.send(json.dumps({"audio": base64_audio}))
+
+                                if response.server_content.turn_complete:
+                                    print('\n<Turn complete>')
+                                    await websocket.send(json.dumps({
+                                        "transcription": {
+                                            "text": "",
+                                            "sender": "Gemini",
+                                            "finished": True
+                                        }
+                                    }))
+
+                except Exception as e:
+                    print(f"Error receiving from Gemini: {e}")
+                finally:
+                    print("Gemini connection closed (receive)")
+
+            send_task = asyncio.create_task(send_to_gemini())
+            receive_task = asyncio.create_task(receive_from_gemini())
+            await asyncio.gather(send_task, receive_task)
+
+    except Exception as e:
+        print(f"Error in Gemini session: {e}")
+    finally:
+        print("Gemini session closed.")
+
+# ----------- Server Entrypoint -------------
+async def main():
+    server = await websockets.server.serve(
+        gemini_session_handler,
+        host="0.0.0.0",
+        port=9084,
+        compression=None
+    )
+    print("Running websocket server on 0.0.0.0:9084...")
+    await asyncio.Future()
+
+if __name__ == "__main__":
+    asyncio.run(main())
